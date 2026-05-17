@@ -1,0 +1,17 @@
+name = "balux-cronjob-machine-events"
+main = "src/worker_machine_events.js"
+compatibility_date = "2025-12-01"
+
+# Cron: cada hora en el minuto 5 (cámbialo si quieres)
+triggers = { crons = ["5 * * * *"] }
+
+# D1 binding
+[[d1_databases]]
+binding = "DB"
+database_name = "balux-database"
+database_id = "16b8be5c-cba5-4c22-9401-adc8e3fa5b75"
+
+# R2 binding (un solo bucket que contiene keys balux-events/...)
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "balux-events"

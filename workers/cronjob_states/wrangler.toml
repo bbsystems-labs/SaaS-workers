@@ -1,0 +1,14 @@
+name = "balux-cronjob-machine-states"
+main = "src/worker_machine_states.js"
+compatibility_date = "2026-01-08"
+
+triggers = { crons = ["*/5 * * * *"] }
+
+[[d1_databases]]
+binding = "DB"
+database_name = "balux-database"
+database_id = "16b8be5c-cba5-4c22-9401-adc8e3fa5b75"
+
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "balux-monitor-operativa"

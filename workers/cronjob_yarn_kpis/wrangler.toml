@@ -1,0 +1,11 @@
+name = "balux-yarn-kpis-job"
+main = "src/worker_yarn_kpis.js"
+compatibility_date = "2026-01-08"
+
+# Diario a las 02:00 UTC (puedes cambiarlo)
+triggers = { crons = ["0 2 * * *"] }
+
+[[d1_databases]]
+binding = "DB"
+database_name = "balux-database"
+database_id = "16b8be5c-cba5-4c22-9401-adc8e3fa5b75"

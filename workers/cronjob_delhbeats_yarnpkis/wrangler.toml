@@ -1,0 +1,17 @@
+name = "balux-scheduler-hbeats-yarn"
+main = "src/scheduler.js"
+compatibility_date = "2025-01-10"
+
+# Un solo cron: cada 5 minutos
+triggers = { crons = ["*/10 * * * *"] }
+# triggers = { crons = ["0 2 * * *"] }
+
+[[d1_databases]]
+binding = "DB"
+database_name = "balux-database"
+database_id = "16b8be5c-cba5-4c22-9401-adc8e3fa5b75"
+
+[[r2_buckets]]
+binding = "BALUX_MONITOR"
+bucket_name = "balux-monitor-operativa"
+

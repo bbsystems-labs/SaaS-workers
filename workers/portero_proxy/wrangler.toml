@@ -1,0 +1,16 @@
+name = "balux-portero"
+main = "src/portero.ts"
+compatibility_date = "2026-01-09"
+
+routes = [
+  { pattern = "clientesprueba.baluxvision.com/*", zone_name = "baluxvision.com" }
+]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "balux-database"
+database_id = "16b8be5c-cba5-4c22-9401-adc8e3fa5b75"
+
+[vars]
+# AQUÍ pones la URL real de tu web, normalmente el .pages.dev del proyecto
+ORIGIN = "https://balux-clients-web2.pages.dev"

@@ -1,0 +1,7 @@
+name = "balux-api-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-01-09"
+
+routes = [
+  { pattern = "api-proxy.baluxvision.com/*", zone_name = "baluxvision.com" }
+]
