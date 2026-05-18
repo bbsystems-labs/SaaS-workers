@@ -10,3 +10,7 @@ triggers = { crons = ["*/10 * * * *"] }
 binding = "DB"
 database_name = "balux-database"
 database_id = "16b8be5c-cba5-4c22-9401-adc8e3fa5b75"
+
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "balux-derived-output"

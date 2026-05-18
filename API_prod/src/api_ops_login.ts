@@ -2003,6 +2003,140 @@ GROUP BY e.machine_id;
         return jsonWithCors(request, { range, from, to, rows });
       }
 
+      if (url.pathname === "/ops/pieces/by-machine") {
+        const { client_id } = await requireClientContext(request, env);
+        const range = parseRange(url);
+        const { from, to } = computeWindow(range, url);
+
+        const machines = parseMachines(url);
+
+        const yarnsRaw = url.searchParams.get("yarns");
+        let yarns = yarnsRaw
+          ? yarnsRaw.split(",").map((s) => s.trim()).filter(Boolean)
+          : [];
+
+        const providerRaw = (url.searchParams.get("provider") || "").trim();
+        if (!yarnsRaw && providerRaw) {
+          const providers = providerRaw
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+
+          const inProv = buildInClause(providers, "y.supplier");
+
+          const provSql = `
+SELECT DISTINCT y.yarn_id
+FROM yarns y
+WHERE y.client_id = ?
+  ${inProv.clause}
+ORDER BY y.yarn_id ASC;
+          `.trim();
+
+          const provOut = await env.DB.prepare(provSql)
+            .bind(client_id, ...inProv.binds)
+            .all<{ yarn_id: string }>();
+
+          yarns = (provOut.results || []).map((r: any) => r.yarn_id);
+        }
+
+        const inMachines = buildInClause(machines, "m.machine_id");
+        const machinesRows = await env.DB.prepare(
+          `SELECT m.machine_id
+           FROM machines m
+           WHERE m.client_id = ? ${inMachines.clause}
+           ORDER BY m.machine_id ASC`
+        )
+          .bind(client_id, ...inMachines.binds)
+          .all<{ machine_id: string }>();
+
+        const machineIds = (machinesRows?.results || []).map((r: any) => r.machine_id);
+        if (machineIds.length === 0) {
+          return jsonWithCors(request, { range, from, to, rows: [] });
+        }
+
+        const inMidSavings = buildInClause(machineIds, "s.machine_id");
+        const inYarns = buildInClause(yarns, "s.yarn_id");
+
+        const savingsSchema = await env.DB.prepare(`PRAGMA table_info(savings)`).all<{ name: string }>();
+        const savingsColumns = new Set((savingsSchema.results || []).map((r: any) => String(r.name || "")));
+        const hasSavingsColumn = (name: string) => savingsColumns.has(name);
+
+        const pieceIdExpr = hasSavingsColumn("piece_id")
+          ? "s.piece_id"
+          : "s.machine_id || '_P' || replace(replace(replace(replace(replace(substr(COALESCE(s.time, ''), 1, 19), '-', ''), 'T', ''), ' ', ''), ':', ''), '+', '')";
+        const pieceStartExpr = hasSavingsColumn("piece_start_time") ? "s.piece_start_time" : "NULL";
+        const pieceEndExpr = hasSavingsColumn("piece_end_time") ? "s.piece_end_time" : "s.time";
+        const productiveTimeExpr = hasSavingsColumn("productive_time_seconds")
+          ? "COALESCE(s.productive_time_seconds, 0)"
+          : "0";
+        const defectsExpr = hasSavingsColumn("defects_count")
+          ? `
+  COALESCE(
+    s.defects_count,
+    (
+      SELECT COUNT(*)
+      FROM machine_events e
+      WHERE e.machine_id = s.machine_id
+        AND e.event = 'defect'
+        AND e.time >= COALESCE(${pieceStartExpr}, s.time)
+        AND e.time <  COALESCE(${pieceEndExpr}, s.time)
+    ),
+    0
+  )`
+          : `
+  COALESCE(
+    (
+      SELECT COUNT(*)
+      FROM machine_events e
+      WHERE e.machine_id = s.machine_id
+        AND e.event = 'defect'
+        AND e.time >= COALESCE(${pieceStartExpr}, s.time)
+        AND e.time <  COALESCE(${pieceEndExpr}, s.time)
+    ),
+    0
+  )`;
+
+        const piecesSql = `
+WITH params AS (
+  SELECT ? AS from_ts, ? AS to_ts
+)
+SELECT
+  s.machine_id,
+  s.yarn_id,
+  ${pieceIdExpr} AS piece_id,
+  ${pieceStartExpr} AS piece_start_time,
+  ${pieceEndExpr} AS piece_end_time,
+  ${productiveTimeExpr} AS productive_time_seconds,
+  ${defectsExpr} AS defects_count,
+  COALESCE(s.saved_kg, 0) AS saved_kg,
+  ROUND(COALESCE(s.saved_kg, 0) / 20.0 * 100.0, 2) AS saved_pct_piece
+FROM savings s
+WHERE s.time >= (SELECT from_ts FROM params)
+  AND s.time <  (SELECT to_ts FROM params)
+  ${inMidSavings.clause}
+  ${inYarns.clause}
+ORDER BY COALESCE(s.piece_end_time, s.time) DESC, s.machine_id ASC, s.piece_id ASC;
+        `.trim();
+
+        const piecesAgg = await env.DB.prepare(piecesSql)
+          .bind(from, to, ...inMidSavings.binds, ...inYarns.binds)
+          .all<any>();
+
+        const rows = (piecesAgg.results || []).map((r: any) => ({
+          machine_id: r.machine_id,
+          yarn_id: r.yarn_id,
+          piece_id: r.piece_id,
+          piece_start_time: r.piece_start_time,
+          piece_end_time: r.piece_end_time,
+          productive_time_seconds: Number(r.productive_time_seconds || 0),
+          defects_count: Number(r.defects_count || 0),
+          saved_kg: Number(r.saved_kg || 0),
+          saved_pct_piece: Number(r.saved_pct_piece || 0),
+        }));
+
+        return jsonWithCors(request, { range, from, to, rows });
+      }
+
 
             // --- Savings by yarn (tabla/diagrama de ahorros) ---
       if (url.pathname === "/ops/savings/by-yarn") {

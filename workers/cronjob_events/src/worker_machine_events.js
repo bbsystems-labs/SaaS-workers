@@ -205,6 +205,8 @@ async function ingestMachineEventsForMachine(db, env, client_id, machine_id) {
   let missing = 0;
   let insertErrors = 0;
 
+  await ensureMachineEventsColumns(db);
+
   for (const c of candidates) {
     const obj = await env.R2_BUCKET.get(c.key);
     if (!obj) continue;
@@ -226,6 +228,13 @@ async function ingestMachineEventsForMachine(db, env, client_id, machine_id) {
     }
 
     const event = c.type; // "defect" | "roll_change"
+    const eventId = event === "defect" ? String(data?.event_id || data?.id || "") || null : null;
+    const stopSignalSent = event === "defect" ? toNullableBool(data?.stop_signal_sent) : null;
+    const relayLatched = event === "defect" ? toNullableBool(data?.relay_latched) : null;
+    const relayResult = event === "defect" ? (data?.relay_result ? String(data.relay_result) : null) : null;
+    const relayCommand = event === "defect" ? (data?.relay_command ? String(data.relay_command) : null) : null;
+    const relayDevice = event === "defect" ? (data?.relay_device ? String(data.relay_device) : null) : null;
+    const stopReason = event === "defect" ? (data?.stop_reason ? String(data.stop_reason) : null) : null;
 
     try {
       const existing = await db
@@ -240,8 +249,33 @@ async function ingestMachineEventsForMachine(db, env, client_id, machine_id) {
 
       if (!existing) {
         await db
-          .prepare(`INSERT INTO machine_events (machine_id, event, time) VALUES (?, ?, ?)`)
-          .bind(mid, event, at)
+          .prepare(
+            `INSERT INTO machine_events (
+               machine_id,
+               event,
+               time,
+               event_id,
+               stop_signal_sent,
+               relay_latched,
+               relay_result,
+               relay_command,
+               relay_device,
+               stop_reason
+             )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .bind(
+            mid,
+            event,
+            at,
+            eventId,
+            stopSignalSent,
+            relayLatched,
+            relayResult,
+            relayCommand,
+            relayDevice,
+            stopReason
+          )
           .run();
       }
 
@@ -286,6 +320,37 @@ async function ingestMachineEventsForMachine(db, env, client_id, machine_id) {
   console.log(
     `[machine_events] DONE machine=${machine_id} ok=${ok} badJson=${badJson} missing=${missing} insertErrors=${insertErrors} elapsed=${Date.now() - t0} ms`
   );
+}
+
+async function ensureMachineEventsColumns(db) {
+  const info = await db.prepare(`PRAGMA table_info(machine_events)`).all();
+  const existing = new Set((info.results || []).map((r) => String(r.name || "")));
+
+  const columns = [
+    ["event_id", "TEXT"],
+    ["stop_signal_sent", "INTEGER"],
+    ["relay_latched", "INTEGER"],
+    ["relay_result", "TEXT"],
+    ["relay_command", "TEXT"],
+    ["relay_device", "TEXT"],
+    ["stop_reason", "TEXT"],
+  ];
+
+  for (const [name, type] of columns) {
+    if (!existing.has(name)) {
+      await db.prepare(`ALTER TABLE machine_events ADD COLUMN ${name} ${type}`).run();
+    }
+  }
+}
+
+function toNullableBool(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "boolean") return value ? 1 : 0;
+  if (typeof value === "number") return value ? 1 : 0;
+  const raw = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y"].includes(raw)) return 1;
+  if (["0", "false", "no", "n"].includes(raw)) return 0;
+  return null;
 }
 
 function shouldProcessEventKey(key, type) {
