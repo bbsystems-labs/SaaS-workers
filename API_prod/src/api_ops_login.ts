@@ -2115,7 +2115,7 @@ WHERE s.time >= (SELECT from_ts FROM params)
   AND s.time <  (SELECT to_ts FROM params)
   ${inMidSavings.clause}
   ${inYarns.clause}
-ORDER BY COALESCE(s.piece_end_time, s.time) DESC, s.machine_id ASC, s.piece_id ASC;
+ORDER BY COALESCE(${pieceEndExpr}, s.time) DESC, s.machine_id ASC, ${pieceIdExpr} ASC;
         `.trim();
 
         const piecesAgg = await env.DB.prepare(piecesSql)
