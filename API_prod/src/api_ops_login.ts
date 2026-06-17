@@ -2282,7 +2282,7 @@ GROUP BY s.yarn_id;
 
         const inYarns = buildInClause(yarnsFinal, "yk.yarn_id");
 
-        // 3) Agregar por yarn en ventana (sumas)
+        // 3) Agregar por yarn en ventana (sumas historicas)
         const sql = `
 WITH params AS (
   SELECT ? AS from_ts, ? AS to_ts
@@ -2307,7 +2307,71 @@ ORDER BY run_time_sum DESC, yk.yarn_id ASC;
           .bind(from, to, ...inYarns.binds)
           .all<any>();
 
-        const rows = (agg.results || []).map((r: any) => {
+        const liveRollsSql = `
+WITH params AS (
+  SELECT ? AS from_ts, ? AS to_ts
+),
+events_with_yarn AS (
+  SELECT
+    (
+      SELECT ya.yarn_id
+      FROM yarn_assignments ya
+      WHERE ya.machine_id = e.machine_id
+        AND ya.start_time <= e.time
+        AND (ya.end_time IS NULL OR ya.end_time = '' OR ya.end_time > e.time)
+      ORDER BY ya.start_time DESC
+      LIMIT 1
+    ) AS yarn_id
+  FROM machine_events e
+  JOIN machines m ON m.machine_id = e.machine_id AND m.client_id = ?
+  WHERE e.time >= (SELECT from_ts FROM params)
+    AND e.time <  (SELECT to_ts FROM params)
+    AND e.event = 'roll_change'
+)
+SELECT ewy.yarn_id, y.yarn_name, COUNT(*) AS rolls_sum
+FROM events_with_yarn ewy
+LEFT JOIN yarns y ON y.yarn_id = ewy.yarn_id
+WHERE ewy.yarn_id IS NOT NULL
+  AND TRIM(ewy.yarn_id) <> ''
+  ${inYarns.clause.replaceAll("yk.yarn_id", "ewy.yarn_id")}
+GROUP BY ewy.yarn_id, y.yarn_name;
+        `.trim();
+
+        const liveRollsAgg = await env.DB.prepare(liveRollsSql)
+          .bind(from, to, client_id, ...inYarns.binds)
+          .all<any>();
+
+        const rowsByYarn = new Map<string, any>();
+        for (const r of agg.results || []) {
+          rowsByYarn.set(String(r.yarn_id), r);
+        }
+
+        for (const r of liveRollsAgg.results || []) {
+          const yarnId = String(r.yarn_id || "");
+          if (!yarnId) continue;
+          const existing = rowsByYarn.get(yarnId);
+          if (existing) {
+            existing.rolls_sum = Number(r.rolls_sum || 0);
+          } else {
+            rowsByYarn.set(yarnId, {
+              yarn_id: yarnId,
+              yarn_name: r.yarn_name ?? null,
+              run_time_sum: 0,
+              rolls_sum: Number(r.rolls_sum || 0),
+              stops_sum: 0,
+              defects_sum: 0,
+            });
+          }
+        }
+
+        const rows = Array.from(rowsByYarn.values())
+          .filter((r: any) =>
+            Number(r.run_time_sum || 0) > 0 ||
+            Number(r.rolls_sum || 0) > 0 ||
+            Number(r.stops_sum || 0) > 0 ||
+            Number(r.defects_sum || 0) > 0
+          )
+          .map((r: any) => {
           const run_time_sum = Number(r.run_time_sum || 0);
           const rolls_sum = Number(r.rolls_sum || 0);
           const stops_sum = Number(r.stops_sum || 0);
@@ -2327,6 +2391,13 @@ ORDER BY run_time_sum DESC, yk.yarn_id ASC;
             fails_per_roll: denom ? defects_sum / denom : null,
           };
         });
+
+        rows.sort(
+          (a: any, b: any) =>
+            (b.run_time_sum - a.run_time_sum) ||
+            (b.rolls_sum - a.rolls_sum) ||
+            String(a.yarn_id).localeCompare(String(b.yarn_id))
+        );
 
         return jsonWithCors(request, { range, from, to, rows });
       }
