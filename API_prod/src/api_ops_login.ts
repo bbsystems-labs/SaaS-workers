@@ -2055,7 +2055,7 @@ ORDER BY y.yarn_id ASC;
         }
 
         const inMidSavings = buildInClause(machineIds, "s.machine_id");
-        const inYarns = buildInClause(yarns, "s.yarn_id");
+        const inMidEvents = buildInClause(machineIds, "e.machine_id");
 
         const savingsSchema = await env.DB.prepare(`PRAGMA table_info(savings)`).all<{ name: string }>();
         const savingsColumns = new Set((savingsSchema.results || []).map((r: any) => String(r.name || "")));
@@ -2066,13 +2066,30 @@ ORDER BY y.yarn_id ASC;
           : "s.machine_id || '_P' || replace(replace(replace(replace(replace(substr(COALESCE(s.time, ''), 1, 19), '-', ''), 'T', ''), ' ', ''), ':', ''), '+', '')";
         const pieceStartExpr = hasSavingsColumn("piece_start_time") ? "s.piece_start_time" : "NULL";
         const pieceEndExpr = hasSavingsColumn("piece_end_time") ? "s.piece_end_time" : "s.time";
-        const productiveTimeExpr = hasSavingsColumn("productive_time_seconds")
-          ? "COALESCE(s.productive_time_seconds, 0)"
-          : "0";
-        const defectsExpr = hasSavingsColumn("defects_count")
-          ? `
-  COALESCE(
-    s.defects_count,
+        const pieceTimeExpr = `COALESCE(${pieceStartExpr}, s.time)`;
+        const effectiveYarnExpr = `
+COALESCE(
+  s.yarn_id,
+  (
+    SELECT ya.yarn_id
+    FROM yarn_assignments ya
+    WHERE ya.machine_id = s.machine_id
+      AND ya.start_time <= ${pieceTimeExpr}
+      AND (ya.end_time IS NULL OR ya.end_time = '' OR ya.end_time > ${pieceTimeExpr})
+    ORDER BY ya.start_time DESC
+    LIMIT 1
+  )
+)`.trim();
+          const productiveTimeExpr = hasSavingsColumn("productive_time_seconds")
+            ? "COALESCE(s.productive_time_seconds, 0)"
+            : "0";
+          const firstDefectPiecePctExpr = hasSavingsColumn("first_defect_piece_pct")
+            ? "s.first_defect_piece_pct"
+            : "NULL";
+          const defectsExpr = hasSavingsColumn("defects_count")
+            ? `
+    COALESCE(
+      s.defects_count,
     (
       SELECT COUNT(*)
       FROM machine_events e
@@ -2096,47 +2113,181 @@ ORDER BY y.yarn_id ASC;
     0
   )`;
 
-        const piecesSql = `
-WITH params AS (
-  SELECT ? AS from_ts, ? AS to_ts
-)
-SELECT
+          const piecesSql = `
+  WITH params AS (
+    SELECT ? AS from_ts, ? AS to_ts
+  )
+  SELECT
   s.machine_id,
-  s.yarn_id,
+  ${effectiveYarnExpr} AS yarn_id,
   ${pieceIdExpr} AS piece_id,
-  ${pieceStartExpr} AS piece_start_time,
-  ${pieceEndExpr} AS piece_end_time,
-  ${productiveTimeExpr} AS productive_time_seconds,
-  ${defectsExpr} AS defects_count,
-  COALESCE(s.saved_kg, 0) AS saved_kg,
-  ROUND(COALESCE(s.saved_kg, 0) / 20.0 * 100.0, 2) AS saved_pct_piece
-FROM savings s
+    ${pieceStartExpr} AS piece_start_time,
+    ${pieceEndExpr} AS piece_end_time,
+    ${productiveTimeExpr} AS productive_time_seconds,
+    ${defectsExpr} AS defects_count,
+    ${firstDefectPiecePctExpr} AS first_defect_piece_pct,
+    COALESCE(s.saved_kg, 0) AS saved_kg,
+    ROUND(COALESCE(s.saved_kg, 0) / 20.0 * 100.0, 2) AS saved_pct_piece
+  FROM savings s
 WHERE s.time >= (SELECT from_ts FROM params)
   AND s.time <  (SELECT to_ts FROM params)
   ${inMidSavings.clause}
-  ${inYarns.clause}
+  ${yarns.length ? `AND ${effectiveYarnExpr} IN (${yarns.map(() => "?").join(",")})` : ""}
 ORDER BY COALESCE(${pieceEndExpr}, s.time) DESC, s.machine_id ASC, ${pieceIdExpr} ASC;
         `.trim();
 
         const piecesAgg = await env.DB.prepare(piecesSql)
-          .bind(from, to, ...inMidSavings.binds, ...inYarns.binds)
+          .bind(from, to, ...inMidSavings.binds, ...yarns)
           .all<any>();
 
-        const rows = (piecesAgg.results || []).map((r: any) => ({
-          machine_id: r.machine_id,
-          yarn_id: r.yarn_id,
-          piece_id: r.piece_id,
-          piece_start_time: r.piece_start_time,
-          piece_end_time: r.piece_end_time,
-          productive_time_seconds: Number(r.productive_time_seconds || 0),
-          defects_count: Number(r.defects_count || 0),
-          saved_kg: Number(r.saved_kg || 0),
-          saved_pct_piece: Number(r.saved_pct_piece || 0),
-        }));
+        const eventPiecesSql = `
+WITH params AS (
+  SELECT ? AS from_ts, ? AS to_ts
+),
+rolls AS (
+  SELECT
+    e.machine_id,
+    e.time AS piece_end_time,
+    (
+      SELECT MAX(prev.time)
+      FROM machine_events prev
+      WHERE prev.machine_id = e.machine_id
+        AND prev.event = 'roll_change'
+        AND prev.time < e.time
+    ) AS piece_start_time
+  FROM machine_events e
+  WHERE e.time >= (SELECT from_ts FROM params)
+    AND e.time <  (SELECT to_ts FROM params)
+    AND e.event = 'roll_change'
+    ${inMidEvents.clause}
+)
+SELECT
+  r.machine_id,
+  COALESCE(
+    (
+      SELECT ya.yarn_id
+      FROM yarn_assignments ya
+      WHERE ya.machine_id = r.machine_id
+        AND ya.start_time <= COALESCE(r.piece_start_time, r.piece_end_time)
+        AND (ya.end_time IS NULL OR ya.end_time = '' OR ya.end_time > COALESCE(r.piece_start_time, r.piece_end_time))
+      ORDER BY ya.start_time DESC
+      LIMIT 1
+    ),
+    (
+      SELECT ya.yarn_id
+      FROM yarn_assignments ya
+      WHERE ya.machine_id = r.machine_id
+        AND ya.start_time <= r.piece_end_time
+        AND (ya.end_time IS NULL OR ya.end_time = '' OR ya.end_time > r.piece_end_time)
+      ORDER BY ya.start_time DESC
+      LIMIT 1
+    )
+  ) AS yarn_id,
+  r.machine_id || '_P' || replace(replace(replace(replace(replace(substr(r.piece_end_time, 1, 19), '-', ''), 'T', ''), ' ', ''), ':', ''), '+', '') AS piece_id,
+  r.piece_start_time,
+  r.piece_end_time,
+  COALESCE(
+    (
+      SELECT SUM(
+        CASE
+          WHEN strftime('%s',
+            CASE
+              WHEN datetime(COALESCE(ms.end_time, r.piece_end_time)) < datetime(r.piece_end_time)
+                THEN COALESCE(ms.end_time, r.piece_end_time)
+              ELSE r.piece_end_time
+            END
+          ) - strftime('%s',
+            CASE
+              WHEN datetime(ms.start_time) > datetime(COALESCE(r.piece_start_time, r.piece_end_time))
+                THEN ms.start_time
+              ELSE COALESCE(r.piece_start_time, r.piece_end_time)
+            END
+          ) > 0
+          THEN strftime('%s',
+            CASE
+              WHEN datetime(COALESCE(ms.end_time, r.piece_end_time)) < datetime(r.piece_end_time)
+                THEN COALESCE(ms.end_time, r.piece_end_time)
+              ELSE r.piece_end_time
+            END
+          ) - strftime('%s',
+            CASE
+              WHEN datetime(ms.start_time) > datetime(COALESCE(r.piece_start_time, r.piece_end_time))
+                THEN ms.start_time
+              ELSE COALESCE(r.piece_start_time, r.piece_end_time)
+            END
+          )
+          ELSE 0
+        END
+      )
+      FROM machine_states ms
+      WHERE ms.machine_id = r.machine_id
+        AND UPPER(ms.status) LIKE 'RUN%'
+        AND datetime(ms.start_time) < datetime(r.piece_end_time)
+        AND datetime(COALESCE(ms.end_time, r.piece_end_time)) > datetime(COALESCE(r.piece_start_time, r.piece_end_time))
+    ),
+    0
+  ) AS productive_time_seconds,
+  COALESCE(
+    (
+      SELECT COUNT(*)
+      FROM machine_events d
+      WHERE d.machine_id = r.machine_id
+        AND d.event = 'defect'
+        AND d.time >= COALESCE(r.piece_start_time, r.piece_end_time)
+        AND d.time < r.piece_end_time
+    ),
+    0
+  ) AS defects_count,
+  NULL AS first_defect_piece_pct,
+  0 AS saved_kg,
+  0 AS saved_pct_piece
+FROM rolls r
+ORDER BY r.piece_end_time DESC, r.machine_id ASC;
+        `.trim();
 
-        return jsonWithCors(request, { range, from, to, rows });
-      }
+        const eventPiecesAgg = await env.DB.prepare(eventPiecesSql)
+          .bind(from, to, ...inMidEvents.binds)
+          .all<any>();
 
+        const yarnFilter = new Set(yarns);
+        const rowsByPiece = new Map<string, any>();
+        const makePieceKey = (row: any) => `${row.machine_id || ""}|${row.piece_end_time || ""}`;
+        const normalizePieceRow = (row: any) => ({
+          machine_id: row.machine_id,
+          yarn_id: row.yarn_id,
+          piece_id: row.piece_id,
+          piece_start_time: row.piece_start_time,
+          piece_end_time: row.piece_end_time,
+          productive_time_seconds: Number(row.productive_time_seconds || 0),
+          defects_count: Number(row.defects_count || 0),
+          first_defect_piece_pct:
+            row.first_defect_piece_pct === null || row.first_defect_piece_pct === undefined
+              ? null
+              : Number(row.first_defect_piece_pct || 0),
+          saved_kg: Number(row.saved_kg || 0),
+          saved_pct_piece: Number(row.saved_pct_piece || 0),
+        });
+
+        for (const r of eventPiecesAgg.results || []) {
+          const row = normalizePieceRow(r);
+          if (yarnFilter.size > 0 && !yarnFilter.has(String(row.yarn_id || ""))) continue;
+          rowsByPiece.set(makePieceKey(row), row);
+        }
+
+        for (const r of piecesAgg.results || []) {
+          const row = normalizePieceRow(r);
+          if (yarnFilter.size > 0 && !yarnFilter.has(String(row.yarn_id || ""))) continue;
+          rowsByPiece.set(makePieceKey(row), row);
+        }
+
+        const rows = Array.from(rowsByPiece.values()).sort((a, b) => {
+          const bt = new Date(b.piece_end_time || b.piece_start_time || 0).getTime();
+          const at = new Date(a.piece_end_time || a.piece_start_time || 0).getTime();
+          return (bt - at) || String(a.machine_id).localeCompare(String(b.machine_id)) || String(a.piece_id).localeCompare(String(b.piece_id));
+        });
+
+          return jsonWithCors(request, { range, from, to, rows });
+        }
 
             // --- Savings by yarn (tabla/diagrama de ahorros) ---
       if (url.pathname === "/ops/savings/by-yarn") {
@@ -2341,6 +2492,60 @@ GROUP BY ewy.yarn_id, y.yarn_name;
           .bind(from, to, client_id, ...inYarns.binds)
           .all<any>();
 
+        const yarnSavingsSchema = await env.DB.prepare(`PRAGMA table_info(savings)`).all<{ name: string }>();
+        const yarnSavingsColumns = new Set((yarnSavingsSchema.results || []).map((r: any) => String(r.name || "")));
+        const hasYarnSavingsColumn = (name: string) => yarnSavingsColumns.has(name);
+        const yarnPieceStartExpr = hasYarnSavingsColumn("piece_start_time") ? "s.piece_start_time" : "NULL";
+        const yarnProductiveTimeExpr = hasYarnSavingsColumn("productive_time_seconds")
+          ? "COALESCE(s.productive_time_seconds, 0)"
+          : "0";
+        const yarnDefectsExpr = hasYarnSavingsColumn("defects_count")
+          ? "COALESCE(s.defects_count, 0)"
+          : "0";
+
+        const savingsMetricsSql = `
+WITH params AS (
+  SELECT ? AS from_ts, ? AS to_ts
+),
+savings_with_yarn AS (
+  SELECT
+    COALESCE(
+      s.yarn_id,
+      (
+        SELECT ya.yarn_id
+        FROM yarn_assignments ya
+        WHERE ya.machine_id = s.machine_id
+          AND ya.start_time <= COALESCE(${yarnPieceStartExpr}, s.time)
+          AND (ya.end_time IS NULL OR ya.end_time = '' OR ya.end_time > COALESCE(${yarnPieceStartExpr}, s.time))
+        ORDER BY ya.start_time DESC
+        LIMIT 1
+      )
+    ) AS yarn_id,
+    ${yarnProductiveTimeExpr} AS productive_time_seconds,
+    CASE
+      WHEN ${yarnDefectsExpr} > 0 THEN ${yarnDefectsExpr}
+      WHEN COALESCE(s.saved_kg, 0) > 0 THEN 1
+      ELSE 0
+    END AS defects_count
+  FROM savings s
+  JOIN machines m ON m.machine_id = s.machine_id AND m.client_id = ?
+  WHERE s.time >= (SELECT from_ts FROM params)
+    AND s.time <  (SELECT to_ts FROM params)
+)
+SELECT yarn_id,
+       SUM(productive_time_seconds) AS run_time_sum,
+       SUM(defects_count) AS defects_sum
+FROM savings_with_yarn
+WHERE yarn_id IS NOT NULL
+  AND TRIM(yarn_id) <> ''
+  ${inYarns.clause.replaceAll("yk.yarn_id", "yarn_id")}
+GROUP BY yarn_id;
+        `.trim();
+
+        const savingsMetricsAgg = await env.DB.prepare(savingsMetricsSql)
+          .bind(from, to, client_id, ...inYarns.binds)
+          .all<any>();
+
         const rowsByYarn = new Map<string, any>();
         for (const r of agg.results || []) {
           rowsByYarn.set(String(r.yarn_id), r);
@@ -2360,6 +2565,25 @@ GROUP BY ewy.yarn_id, y.yarn_name;
               rolls_sum: Number(r.rolls_sum || 0),
               stops_sum: 0,
               defects_sum: 0,
+            });
+          }
+        }
+
+        for (const r of savingsMetricsAgg.results || []) {
+          const yarnId = String(r.yarn_id || "");
+          if (!yarnId) continue;
+          const existing = rowsByYarn.get(yarnId);
+          if (existing) {
+            existing.run_time_sum = Math.max(Number(existing.run_time_sum || 0), Number(r.run_time_sum || 0));
+            existing.defects_sum = Math.max(Number(existing.defects_sum || 0), Number(r.defects_sum || 0));
+          } else {
+            rowsByYarn.set(yarnId, {
+              yarn_id: yarnId,
+              yarn_name: null,
+              run_time_sum: Number(r.run_time_sum || 0),
+              rolls_sum: 0,
+              stops_sum: 0,
+              defects_sum: Number(r.defects_sum || 0),
             });
           }
         }
