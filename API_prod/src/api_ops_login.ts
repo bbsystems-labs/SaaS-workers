@@ -1,6 +1,7 @@
 export interface Env {
   DB: any; // D1 binding
   R2_BUCKET?: any; // R2 states binding
+  R2_DERIVED_BUCKET?: any; // R2 derived outputs binding
   OPENAI_API_KEY?: string;
   OPENAI_MODEL?: string;
 }
@@ -31,6 +32,22 @@ function jsonWithCors(request: Request, data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers });
 }
 
+function binaryWithCors(
+  request: Request,
+  body: BodyInit | null,
+  contentType: string,
+  status = 200,
+  extraHeaders: Record<string, string> = {},
+): Response {
+  const headers = buildCorsHeaders(request);
+  headers.set("content-type", contentType);
+  headers.set("cache-control", "no-store");
+  for (const [key, value] of Object.entries(extraHeaders)) {
+    headers.set(key, value);
+  }
+  return new Response(body, { status, headers });
+}
+
 
 function getAccessEmail(request: Request): string | null {
   return (
@@ -38,6 +55,57 @@ function getAccessEmail(request: Request): string | null {
     request.headers.get("Cf-Access-Authenticated-User-Email") ||
     request.headers.get("x-access-user-email")
   );
+}
+
+function buildPieceSummaryKey(clientId: string, machineId: string, pieceId: string) {
+  const match = String(pieceId || "").match(/_P(\d{8,})$/);
+  const digits = match?.[1] || "";
+  const year = digits.slice(0, 4);
+  const month = digits.slice(4, 6);
+  const day = digits.slice(6, 8);
+  if (!clientId || !machineId || !pieceId || digits.length < 8) return null;
+  return `savings/${clientId}/${machineId}/${year}/${month}/${day}/${pieceId}/piece_summary.json`;
+}
+
+async function ensurePieceRecalcCursorTable(DB: any) {
+  await DB.prepare(
+    `CREATE TABLE IF NOT EXISTS piece_recalc_cursor (
+       machine_id TEXT PRIMARY KEY,
+       recalc_from TEXT,
+       updated_at TEXT
+     )`
+  ).run();
+}
+
+async function markPieceRecalcFrom(DB: any, machineId: string, recalcFrom: string) {
+  await ensurePieceRecalcCursorTable(DB);
+  const updatedAt = nowIso();
+  const row = await DB.prepare(
+    `SELECT recalc_from
+     FROM piece_recalc_cursor
+     WHERE machine_id = ?
+     LIMIT 1`
+  )
+    .bind(machineId)
+    .first<{ recalc_from: string | null }>();
+
+  const next = !row?.recalc_from || row.recalc_from > recalcFrom ? recalcFrom : row.recalc_from;
+  if (row) {
+    await DB.prepare(
+      `UPDATE piece_recalc_cursor
+       SET recalc_from = ?, updated_at = ?
+       WHERE machine_id = ?`
+    )
+      .bind(next, updatedAt, machineId)
+      .run();
+  } else {
+    await DB.prepare(
+      `INSERT INTO piece_recalc_cursor (machine_id, recalc_from, updated_at)
+       VALUES (?, ?, ?)`
+    )
+      .bind(machineId, next, updatedAt)
+      .run();
+  }
 }
 
 function nowIso(): string {
@@ -2003,7 +2071,7 @@ GROUP BY e.machine_id;
         return jsonWithCors(request, { range, from, to, rows });
       }
 
-      if (url.pathname === "/ops/pieces/by-machine") {
+        if (url.pathname === "/ops/pieces/by-machine") {
         const { client_id } = await requireClientContext(request, env);
         const range = parseRange(url);
         const { from, to } = computeWindow(range, url);
@@ -2289,7 +2357,70 @@ ORDER BY r.piece_end_time DESC, r.machine_id ASC;
           return jsonWithCors(request, { range, from, to, rows });
         }
 
-            // --- Savings by yarn (tabla/diagrama de ahorros) ---
+        if (url.pathname === "/ops/piece-summary") {
+          const { client_id } = await requireClientContext(request, env);
+          const machineId = (url.searchParams.get("machine_id") || "").trim();
+          const pieceId = (url.searchParams.get("piece_id") || "").trim();
+          if (!machineId || !pieceId) {
+            return jsonWithCors(request, { error: "machine_id y piece_id son requeridos" }, 400);
+          }
+
+          const bucket = env.R2_DERIVED_BUCKET || env.R2_BUCKET;
+          if (!bucket) {
+            return jsonWithCors(request, { error: "R2 no configurado" }, 500);
+          }
+
+          const key = buildPieceSummaryKey(client_id, machineId, pieceId);
+          if (!key) {
+            return jsonWithCors(request, { error: "piece_id invalido" }, 400);
+          }
+
+          const obj = await bucket.get(key);
+          if (!obj) {
+            return jsonWithCors(request, { error: "piece summary no encontrado" }, 404);
+          }
+
+          const summary = await obj.json<any>();
+          return jsonWithCors(request, { key, summary });
+        }
+
+        if (url.pathname === "/ops/piece-report") {
+          const { client_id } = await requireClientContext(request, env);
+          const machineId = (url.searchParams.get("machine_id") || "").trim();
+          const pieceId = (url.searchParams.get("piece_id") || "").trim();
+          if (!machineId || !pieceId) {
+            return jsonWithCors(request, { error: "machine_id y piece_id son requeridos" }, 400);
+          }
+
+          const bucket = env.R2_DERIVED_BUCKET || env.R2_BUCKET;
+          if (!bucket) {
+            return jsonWithCors(request, { error: "R2 no configurado" }, 500);
+          }
+
+          const key = buildPieceSummaryKey(client_id, machineId, pieceId);
+          if (!key) {
+            return jsonWithCors(request, { error: "piece_id invalido" }, 400);
+          }
+
+          const reportKey = key.replace("/piece_summary.json", "/piece_report.pdf");
+          const obj = await bucket.get(reportKey);
+          if (!obj) {
+            return jsonWithCors(request, { error: "piece report no encontrado" }, 404);
+          }
+
+          return binaryWithCors(
+            request,
+            obj.body,
+            "application/pdf",
+            200,
+            {
+              "content-disposition": `inline; filename="${pieceId}.pdf"`,
+            },
+          );
+        }
+
+
+              // --- Savings by yarn (tabla/diagrama de ahorros) ---
       if (url.pathname === "/ops/savings/by-yarn") {
         const { client_id } = await requireClientContext(request, env);
         const range = parseRange(url);
@@ -2805,6 +2936,8 @@ GROUP BY yarn_id;
               .bind(client_id, nextRecalc)
               .run();
           }
+
+          await markPieceRecalcFrom(env.DB, machine_id, start_time);
         }
 
         return jsonWithCors(request, 
@@ -2916,6 +3049,17 @@ ORDER BY machines_count DESC, yarn_id ASC;
             .bind(client_id, yarn_id)
             .first<{ min_start: string | null }>();
 
+          const affectedMachinesRows = await env.DB.prepare(
+            `SELECT DISTINCT machine_id
+             FROM yarn_assignments
+             WHERE yarn_id = ?`
+          )
+            .bind(yarn_id)
+            .all<{ machine_id: string }>();
+          const affectedMachineIds = (affectedMachinesRows.results || [])
+            .map((r: any) => String(r.machine_id || "").trim())
+            .filter(Boolean);
+
           await env.DB.prepare(
             `DELETE FROM yarn_assignments
              WHERE yarn_id = ?
@@ -2956,11 +3100,11 @@ ORDER BY machines_count DESC, yarn_id ASC;
               nextRecalc = cursorRow.recalc_from;
             }
 
-            if (cursorRow) {
-              await env.DB.prepare(
-                `UPDATE yarn_kpis_cursor
-                 SET recalc_from = ?
-                 WHERE client_id = ?`
+              if (cursorRow) {
+                await env.DB.prepare(
+                  `UPDATE yarn_kpis_cursor
+                   SET recalc_from = ?
+                   WHERE client_id = ?`
               )
                 .bind(nextRecalc, client_id)
                 .run();
@@ -2971,6 +3115,13 @@ ORDER BY machines_count DESC, yarn_id ASC;
               )
                 .bind(client_id, nextRecalc)
                 .run();
+            }
+
+            for (const machineId of affectedMachineIds) {
+              const recalcFrom = minAssignment.min_start || recalcDay;
+              if (recalcFrom) {
+                await markPieceRecalcFrom(env.DB, machineId, recalcFrom);
+              }
             }
           }
 
