@@ -2195,7 +2195,8 @@ COALESCE(
     ${defectsExpr} AS defects_count,
     ${firstDefectPiecePctExpr} AS first_defect_piece_pct,
     COALESCE(s.saved_kg, 0) AS saved_kg,
-    ROUND(COALESCE(s.saved_kg, 0) / 20.0 * 100.0, 2) AS saved_pct_piece
+    ROUND(COALESCE(s.saved_kg, 0) / 20.0 * 100.0, 2) AS saved_pct_piece,
+    1 AS has_savings
   FROM savings s
 WHERE s.time >= (SELECT from_ts FROM params)
   AND s.time <  (SELECT to_ts FROM params)
@@ -2308,7 +2309,8 @@ SELECT
   ) AS defects_count,
   NULL AS first_defect_piece_pct,
   0 AS saved_kg,
-  0 AS saved_pct_piece
+  0 AS saved_pct_piece,
+  0 AS has_savings
 FROM rolls r
 ORDER BY r.piece_end_time DESC, r.machine_id ASC;
         `.trim();
@@ -2334,6 +2336,7 @@ ORDER BY r.piece_end_time DESC, r.machine_id ASC;
               : Number(row.first_defect_piece_pct || 0),
           saved_kg: Number(row.saved_kg || 0),
           saved_pct_piece: Number(row.saved_pct_piece || 0),
+          has_savings: Boolean(Number(row.has_savings || 0)),
         });
 
         for (const r of eventPiecesAgg.results || []) {
