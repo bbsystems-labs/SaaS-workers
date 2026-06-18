@@ -1998,6 +1998,10 @@ ORDER BY y.yarn_id ASC;
         // Filtro yarns opcional (solo afecta a savings)
         const inYarns = buildInClause(yarns, "s.yarn_id");
 
+        const savingsSchema = await env.DB.prepare(`PRAGMA table_info(savings)`).all<{ name: string }>();
+        const savingsColumns = new Set((savingsSchema.results || []).map((r: any) => String(r.name || "")));
+        const defectsCountExpr = savingsColumns.has("defects_count") ? "COALESCE(s.defects_count, 0)" : "0";
+
         // 2) Agregado savings por máquina
         const savingsSql = `
 WITH params AS (
@@ -2006,7 +2010,7 @@ WITH params AS (
 SELECT
   s.machine_id,
   SUM(COALESCE(s.saved_kg, 0)) AS saved_kg,
-  COUNT(*) AS rolls_intervenidos
+  SUM(CASE WHEN COALESCE(s.saved_kg, 0) > 0 OR ${defectsCountExpr} > 0 THEN 1 ELSE 0 END) AS rolls_intervenidos
 FROM savings s
 WHERE s.time >= (SELECT from_ts FROM params)
   AND s.time <  (SELECT to_ts FROM params)
@@ -2486,6 +2490,10 @@ ORDER BY y.yarn_id ASC;
         // Filtro yarns opcional
         const inYarns = buildInClause(yarns, "s.yarn_id");
 
+        const yarnSavingsSchema = await env.DB.prepare(`PRAGMA table_info(savings)`).all<{ name: string }>();
+        const yarnSavingsColumns = new Set((yarnSavingsSchema.results || []).map((r: any) => String(r.name || "")));
+        const yarnDefectsCountExpr = yarnSavingsColumns.has("defects_count") ? "COALESCE(s.defects_count, 0)" : "0";
+
         // 2) Agregado savings por yarn
         // NOTA: uso s.saved_kg y s.time y s.yarn_id (ajusta nombres si difieren)
         const savingsSql = `
@@ -2495,7 +2503,7 @@ WITH params AS (
 SELECT
   s.yarn_id,
   SUM(COALESCE(s.saved_kg, 0)) AS saved_kg,
-  COUNT(*) AS rolls_intervenidos
+  SUM(CASE WHEN COALESCE(s.saved_kg, 0) > 0 OR ${yarnDefectsCountExpr} > 0 THEN 1 ELSE 0 END) AS rolls_intervenidos
 FROM savings s
 WHERE s.time >= (SELECT from_ts FROM params)
   AND s.time <  (SELECT to_ts FROM params)
