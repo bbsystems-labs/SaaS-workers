@@ -531,11 +531,11 @@ function buildPieceReportPdfBytes(summary) {
   }
 
   const barX = 76;
-  const barY = 165;
+  const barY = 105;
   const barW = pageWidth - 152;
   const barH = 26;
 
-  drawText(margin, 232, "PIEZA", { size: 12, font: "F2", color: [0.46, 0.54, 0.6] });
+  drawText(margin, 172, "PIEZA", { size: 12, font: "F2", color: [0.46, 0.54, 0.6] });
   drawRect(barX, barY, barW, barH, [0.78, 0.82, 0.86], [0.92, 0.95, 0.98], 1);
   drawLine(barX, barY + barH + 10, barX + barW, barY + barH + 10, [0.16, 0.34, 0.48], 2);
 
@@ -549,7 +549,7 @@ function buildPieceReportPdfBytes(summary) {
   }
 
   const placedLabels = [];
-  const labelLanes = [244, 270, 296, 322];
+  const labelLanes = [184, 210, 236, 262];
   const sortedDefects = defects
     .map((defect, index) => ({
       defect,
