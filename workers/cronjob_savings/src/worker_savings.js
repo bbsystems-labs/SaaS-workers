@@ -399,6 +399,20 @@ function formatPercent(value) {
   return `${Math.round(pct * 10) / 10}%`;
 }
 
+function getDefectProgressPct(defect, totalRunSeconds) {
+  const explicitPct = Number(defect?.piece_progress_pct);
+  if (Number.isFinite(explicitPct)) {
+    return Math.max(0, Math.min(100, explicitPct));
+  }
+
+  const productiveSeconds = Number(defect?.productive_seconds_from_piece_start);
+  if (Number.isFinite(productiveSeconds) && Number(totalRunSeconds || 0) > 0) {
+    return buildPieceProgressPct(productiveSeconds, totalRunSeconds);
+  }
+
+  return 0;
+}
+
 function buildPieceReportPdfBytes(summary) {
   const piece = summary?.piece || {};
   const defects = Array.isArray(summary?.defects) ? summary.defects : [];
@@ -410,6 +424,7 @@ function buildPieceReportPdfBytes(summary) {
   const productiveTime = formatDurationShort(piece.productive_time_seconds);
   const defectsCount = defects.length;
   const totalPct = 100;
+  const totalProductiveSeconds = Number(piece.productive_time_seconds || 0);
 
   const pageWidth = 842;
   const pageHeight = 595;
@@ -458,6 +473,23 @@ function buildPieceReportPdfBytes(summary) {
     commands.push(`1 0 0 1 ${finalX.toFixed(2)} ${y.toFixed(2)} Tm`);
     commands.push(`(${safe}) Tj`);
     commands.push("ET");
+  };
+
+  const drawTextBox = (x, y, w, h, text, options = {}) => {
+    const {
+      fill = [0.12, 0.18, 0.26],
+      stroke = [0.12, 0.18, 0.26],
+      textColor = [1, 1, 1],
+      size = 8,
+      font = "F2",
+    } = options;
+    drawRect(x, y, w, h, stroke, fill, 1);
+    drawText(x + w / 2, y + h / 2 - size * 0.34, text, {
+      size,
+      font,
+      color: textColor,
+      centered: true,
+    });
   };
 
   commands.push("q");
@@ -516,17 +548,59 @@ function buildPieceReportPdfBytes(summary) {
     });
   }
 
-  for (const defect of defects) {
-    const pct = Math.max(0, Math.min(100, Number(defect.piece_progress_pct || 0)));
+  const placedLabels = [];
+  const labelLanes = [244, 270, 296, 322];
+  const sortedDefects = defects
+    .map((defect, index) => ({
+      defect,
+      index,
+      pct: getDefectProgressPct(defect, totalProductiveSeconds),
+    }))
+    .sort((a, b) => a.pct - b.pct || a.index - b.index);
+
+  for (const item of sortedDefects) {
+    const { defect, pct } = item;
     const x = barX + (pct / totalPct) * barW;
     const stamp = formatMadridDateTime(defect.timestamp || defect.time, true);
-    drawText(x, 212, stamp, { size: 9, font: "F2", color: [0.6, 0.11, 0.11], centered: true });
+    const labelW = Math.max(92, Math.min(122, stamp.length * 5.4));
+    let labelX = Math.max(barX, Math.min(barX + barW - labelW, x - labelW / 2));
+    let laneIndex = 0;
+
+    for (let attempt = 0; attempt < labelLanes.length; attempt += 1) {
+      const laneY = labelLanes[attempt];
+      const overlaps = placedLabels.some(
+        (label) => label.laneY === laneY && labelX < label.x + label.w + 8 && labelX + labelW + 8 > label.x
+      );
+      if (!overlaps) {
+        laneIndex = attempt;
+        break;
+      }
+      laneIndex = attempt;
+    }
+
+    const laneY = labelLanes[laneIndex];
+    if (laneIndex === labelLanes.length - 1) {
+      const sameLane = placedLabels.filter((label) => label.laneY === laneY).sort((a, b) => a.x - b.x);
+      for (const label of sameLane) {
+        if (labelX < label.x + label.w + 8 && labelX + labelW + 8 > label.x) {
+          labelX = Math.min(barX + barW - labelW, label.x + label.w + 8);
+        }
+      }
+    }
+
+    placedLabels.push({ x: labelX, w: labelW, laneY });
+
+    drawLine(x, barY + barH + 10, x, laneY - 3, [0.75, 0.07, 0.07], 1);
+    drawTextBox(labelX, laneY, labelW, 18, stamp, {
+      fill: [0.42, 0.06, 0.08],
+      stroke: [0.63, 0.08, 0.11],
+      size: 8,
+    });
     drawRect(x - 4, barY + barH - 2, 8, 12, [0.75, 0.07, 0.07], [0.9, 0.24, 0.24], 1);
-    drawText(x, barY + 7, formatPercent(defect.piece_progress_pct || 0), {
-      size: 9,
-      font: "F2",
-      color: [1, 1, 1],
-      centered: true,
+    drawTextBox(Math.max(barX, Math.min(barX + barW - 34, x - 17)), barY + 4, 34, 13, formatPercent(pct), {
+      fill: [0.07, 0.14, 0.24],
+      stroke: [0.07, 0.14, 0.24],
+      size: 8,
     });
   }
 
